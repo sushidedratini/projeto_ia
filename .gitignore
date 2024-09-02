@@ -1,2 +1,11 @@
 *.pt
 *.csv
+*.mp4
+*.png
+*.zip
+*.rar
+
+/__pycache__/*
+/downloaded_videos/*
+/trimmed_videos/*
+/graphs/*

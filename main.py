@@ -1,229 +1,273 @@
-from collections import defaultdict
-from scipy.spatial import distance
-
+import ast
+import sys
+from typing import List, Dict
 import cv2
 import torch
-import numpy as np
+import torchvision
 import pandas as pd
+import numpy as np
+
 from ultralytics import YOLO
+from skimage.metrics import structural_similarity as ssim
+from sklearn.model_selection import train_test_split  # type: ignore
+from sklearn.ensemble import RandomForestClassifier  # type: ignore
+from sklearn.metrics import accuracy_score # type: ignore
 
-'''
-CLASSNAMES
+from utils import create_race_dataset, plot_rider_tracks, save_to_csv # type: ignore
+from post_operations import clean_track_history, fill_centroid_lists
+from video_utils import prepare_dict_trimmed_videos
+from winner import add_direction_to_track_history, determine_winner
 
-{0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 
-8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 
-14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 
-22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 
-29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 
-35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 
-40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 
-48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 
-55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 
-62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 
-69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 
-76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
-'''
 
-def save_to_csv(df, file_path):
-    df.to_csv(file_path, index=False)
+def detect_camera_change(frame1, frame2, threshold=0.5):
+    # Convert frames to grayscale
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
 
-def normalize_centroids(tracks, frame_shape):
-    frame_height, frame_width = frame_shape
+    # Compute Structural Similarity Index (SSIM)
+    score, _ = ssim(gray1, gray2, full=True)
+    print(score)
 
-    for track_id, centroids in tracks.items():
-        normalized_centroids = [(round(x / frame_width, 3), round(y / frame_height, 3)) for x, y in centroids]
-        tracks[track_id] = normalized_centroids
+    # Check if the SSIM score is below the threshold
+    if score < threshold:
+        return True  # Camera change detected
+    return False  # No significant change
 
-    return tracks
-
-def extend_tracks(tracks, tiredness_factor=0.05):
-    # Find the length of the longest list
-    max_length = max(len(centroids) for centroids in tracks.values())
-
-    for track_id, centroids in tracks.items():
-        current_length = len(centroids)
-
-        if current_length < max_length:
-            # Calculate variations in x and y coordinates
-            x_coords = [coord[0] for coord in centroids]
-            y_coords = [coord[1] for coord in centroids]
-
-            if current_length > 1:
-                x_variation = (x_coords[-1] - x_coords[0]) / (current_length - 1)
-                y_variation = (y_coords[-1] - y_coords[0]) / (current_length - 1)
-            else:
-                x_variation = 0
-                y_variation = 0
-
-            # Determine the pattern of y movement
-            y_diff = np.diff(y_coords)
-            up_frames = np.sum(y_diff > 0)
-            down_frames = np.sum(y_diff < 0)
-
-            # Generate new x, y values to fill the empty positions
-            for i in range(current_length, max_length):
-                new_x = x_coords[-1] + x_variation
-
-                # Determine if the y value should increase or decrease
-                if up_frames > down_frames:
-                    new_y = y_coords[-1] + y_variation * (1 + tiredness_factor * (i / max_length))
-                    up_frames -= 1  # Use one up-frame
-                else:
-                    new_y = y_coords[-1] - y_variation * (1 + tiredness_factor * (i / max_length))
-                    down_frames -= 1  # Use one down-frame
-
-                centroids.append((new_x, new_y))
-                x_coords.append(new_x)
-                y_coords.append(new_y)
-
-    return tracks
-
-def create_race_dataset(tracks, frame_shape):
-    data = []
-
-    # Exnend all tracks that have short length
-    tracks = extend_tracks(tracks)
-
-    # Normalize the centroids
-    tracks = normalize_centroids(tracks, frame_shape)
-
-    for track_id, centroids in tracks.items():
-        row = {
-            'id': track_id,
-            'winner': 0,
-            'centroids': centroids
-        }
-        data.append(row)
-
-    df = pd.DataFrame(data)
-    return df
 
 def calculate_centroid(bbox):
-    x, y, w, h = bbox.xywh[0]
-    return (int(x + w / 2), int(y + h / 2))
+    x_min, y_min, x_max, y_max = bbox
+    x_center = (x_min.item() + x_max.item()) / 2
+    y_center = (y_min.item() + y_max.item()) / 2
+    return (x_center, y_center)
 
-def initialize_tracks(detections, frame_shape):
-    tracks = {}
-    track_id = 0
-    boxes = detections.boxes
-    for box in boxes:
-        centroid = calculate_centroid(box)
-        tracks[track_id] = [centroid]
-        track_id += 1
+
+def normalize_centroids(tracks: List[Dict], width, height):
+
+    for track_dict in tracks:
+        for _, values in track_dict.items():
+            normalized_centroids = [
+                (round(x / width, 3), round(y / height, 3)) for x, y in values['CENTROIDS']]
+            values['CENTROIDS'] = normalized_centroids
+
     return tracks
 
-def update_tracks(tracks, detections, frame_shape):
-    new_tracks = defaultdict(list)
-    used_ids = set()
-    
-    boxes = detections.boxes
+
+def calculate_iou(bbox1, bbox2):
+    box_1_xyxy = bbox1.xyxy.cpu()
+    box_2_xyxy = bbox2.xyxy.cpu()
+
+    iou = torchvision.ops.box_iou(box_1_xyxy, box_2_xyxy)
+
+    return iou
+
+
+def best_iou_found(obj_bbox, iter_bboxes, threshold) -> bool:
+    best_obj = None
+    best_iou = 0
+
+    for bbox in iter_bboxes:
+        iou = calculate_iou(obj_bbox, bbox)
+        if iou > best_iou:
+            best_iou = iou
+            best_obj = bbox
+
+    if best_obj and best_iou >= threshold:
+        return True
+    return False
+
+
+def track_riders(herd, people, current_track):
+    for person in people:
+
+        person_bbox_xyxy = person.xyxy.cpu()
+        person_bbox_centroid = calculate_centroid(person_bbox_xyxy[0])
+
+        # Person and Horse verification
+        # If false, skip as person is not a horse rider
+        if best_iou_found(person, herd, threshold=0.4) and person.id is not None:
+            person_id: int = person.id.item()
+            if person_id in current_track:
+                current_track[person_id]['CENTROIDS'].append(
+                    person_bbox_centroid)
+                current_track[person_id]['LAST_BBOX'] = person
+                current_track[person_id]['WINNER'] = 0
+            else:
+                best_iou = 0
+                best_id = None
+                for key, value in current_track.items():
+                    temp_bbox = value['LAST_BBOX']
+                    iou = calculate_iou(person, temp_bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_id = key
+
+                if best_id and best_iou >= 0.5:
+                    current_track[int(best_id)]['CENTROIDS'].append(
+                        person_bbox_centroid)
+                    current_track[int(best_id)]['LAST_BBOX'] = person
+                    current_track[int(best_id)]['WINNER'] = 0
+
+                # New person?
+                else:
+                    current_track[person_id] = {
+                        'CENTROIDS': [person_bbox_centroid],
+                        'LAST_BBOX': person,
+                        'WINNER': 0
+                    }
+
+    return current_track
+
+
+def plot_frame(frame, boxes):
     for box in boxes:
-        centroid = calculate_centroid(box)
-        min_distance = float('inf')
-        assigned_id = None
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        # confidence = box.conf.item()  # Confidence score
+        if not box.id:
+            continue
+        box_id = int(box.id.item())
 
-        # Find the closest existing track
-        for track_id, centroids in tracks.items():
-            if track_id in used_ids:
-                continue  # Skip already used tracks
+        label = f'{box_id}'  # {confidence:.2f}
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
 
-            dist = distance.euclidean(centroid, centroids[-1])
-            if dist < min_distance:
-                min_distance = dist
-                assigned_id = track_id
+        cv2.rectangle(frame, (x1, y1), (x2, y2),
+                      (255, 0, 0), 2)
+        cv2.rectangle(frame, (x1, y1 - text_height - baseline),
+                      (x1 + text_width, y1), (255, 0, 0), thickness=cv2.FILLED)
+        cv2.putText(frame, f'{box_id}', (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
-        if assigned_id is not None:
-            new_tracks[assigned_id] = tracks[assigned_id] + [centroid]
-            used_ids.add(assigned_id)
-        else:
-            # Create a new track ID
-            new_id = max(tracks.keys(), default=-1) + 1
-            new_tracks[new_id] = [centroid]
-            used_ids.add(new_id)
+    return frame
 
-    # Merge with existing tracks
-    for track_id, centroids in tracks.items():
-        if track_id not in new_tracks:
-            new_tracks[track_id] = centroids
 
-    return new_tracks
+def get_track_history(model, file_name, test=False):
+    cap = cv2.VideoCapture(file_name)
+    ret, prev_frame = cap.read()
 
-def main() -> None:
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
-    # Load the YOLOv8 model
-    model = YOLO('yolov8m.pt')
-
-    cap = cv2.VideoCapture('corrida.mp4')
-    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"# of Frames: {num_frames}")
-    tracks = {}
-
-    # Store the track history
-    track_history = defaultdict(lambda: [])
-    new_history = {}
+    track_history = []
+    current_track = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        width  = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        curr_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        results = model.track(frame, persist=True,
+                              show_conf=True, classes=[0, 17], device='cuda')
 
-        # Get only class 17 (horse)
-        results = model.track(frame, persist=True, tracker="bytetrack.yaml", show_conf=True, classes=[0, 17])
+        if detect_camera_change(prev_frame, frame) and current_track:
+            track_history.append(current_track)
+            current_track = {}
 
-        # Get the boxes and track IDs
-        boxes = results[0].boxes.xywhn.cpu()
+        herd = [box for box in results[0].boxes if box.cls == 17]  # Horse
+        people = [box for box in results[0].boxes if box.cls == 0]  # Person
 
-        if results[0].boxes.id is None: break
-        track_ids = results[0].boxes.id.int().cpu().tolist()
+        current_track = track_riders(herd, people, current_track)
 
-        # Lambda function to generate list of 1024 None values if ID is not in dictionary
-        generate_none_list = lambda x: new_history.setdefault(x, [None] * num_frames)
-
-        # Apply the lambda function to each ID in the list
-        for id in track_ids:
-            generate_none_list(id)
-
-        # Visualize the results on the frame
-        annotated_frame = results[0].plot()
-
-        # Plot the tracks
-        for box, track_id in zip(boxes, track_ids):
-            x, y, w, h = box
-            track = track_history[track_id]
-            track.append((float(x), float(y)))  # x, y center point
-            if len(track) > 30:  # retain 90 tracks for 90 frames
-                track.pop(0)
-
-            new_history[track_id][curr_frame] = (float(x), float(y))
-
-            # Draw the tracking lines
-            points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
-            cv2.polylines(annotated_frame, [points], isClosed=False, color=(230, 230, 230), thickness=2)
-                
-            break
-
-        for result in results:
-            if not tracks:
-                tracks = initialize_tracks(result, (width, height))
-            else:
-                tracks = update_tracks(tracks, result, (width, height))
+        prev_frame = frame
+        annotated_frame = None
+        if test is not False:
+            annotated_frame = plot_frame(frame, people)
+        else:
+            annotated_frame = frame
 
         cv2.imshow("Projeto Final IA", annotated_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    if current_track:
+        track_history.append(current_track)
+
     cap.release()
     cv2.destroyAllWindows()
 
-    race_df = create_race_dataset(tracks, (width, height))
+    # Determine Winner for all scenes
+    add_direction_to_track_history(track_history, num_points=10)
+    if test is not False:
+        determine_winner(track_history, width, height)
 
-    # Save the dataset to a CSV file
-    save_to_csv(race_df, 'race_dataset.csv')
+    # Post Operations
+    final_list = clean_track_history(track_history)
+    final_list = fill_centroid_lists(final_list)
+    final_list = normalize_centroids(final_list, width, height)
+
+    return final_list
+
+def convert_to_numeric_list(y_values):
+    if isinstance(y_values, str):
+        y_values = ast.literal_eval(y_values)
+    return [float(value) for value in y_values]
+
+def extract_features_from_sequences(df):
+    df['y_values'] = df['y_values'].apply(convert_to_numeric_list)
+    df['y_mean'] = df['y_values'].apply(np.mean)
+    df['y_std'] = df['y_values'].apply(np.std)
+    df['y_min'] = df['y_values'].apply(np.min)
+    df['y_max'] = df['y_values'].apply(np.max)
+    return df[['y_mean', 'y_std', 'y_min', 'y_max']], df['winner']
+
+def train_and_test(train_file_name, test_file_name) -> None:
+    df = pd.read_csv(train_file_name)
+    new_video_df = pd.read_csv(test_file_name)
+
+    X, y = extract_features_from_sequences(df)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Train the model
+    model = RandomForestClassifier()
+    model.fit(X_train, y_train)
+
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Training accuracy: {accuracy:.2f}")
+
+    X_new, _ = extract_features_from_sequences(new_video_df)
+
+    new_predictions = model.predict(X_new)
+
+    new_video_df['predicted_winner'] = new_predictions
+    new_video_df.to_csv('new_video_predictions.csv', index=False)
+
+def main() -> None:
+
+    if not torch.cuda.is_available():
+        print("CUDA not available!")
+        sys.exit()
+
+    torch.cuda.set_device(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = YOLO('yolov8m.pt')
+    model.to(device=device)
+
+    # Download and trim videos
+    video_list: List[Dict] = prepare_dict_trimmed_videos()
+
+    all_track_histories = []
+    for dict_video in video_list:
+        for _, video_path in dict_video.items():
+            track_history = get_track_history(model, video_path, True)
+            all_track_histories.append(track_history)
+
+    csv_file_name = 'race_dataset_new.csv'
+    race_df = create_race_dataset(all_track_histories)
+    # plot_rider_tracks(race_df)
+    save_to_csv(race_df, csv_file_name)
+
+    test_track_history = get_track_history(
+        model, r"D:\Workspace\IA\ProjetoFinal\test_video_trimmed.mp4")
+    test_race_df = create_race_dataset([test_track_history])
+    csv_test_file_name = 'test_dataset.csv'
+    save_to_csv(test_race_df, csv_test_file_name)
+
+    train_and_test(csv_file_name, csv_test_file_name)
+
 
 if __name__ == '__main__':
     main()
