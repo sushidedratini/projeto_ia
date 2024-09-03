@@ -1,4 +1,5 @@
 import ast
+import os
 import sys
 from typing import List, Dict
 import cv2
@@ -6,14 +7,15 @@ import torch
 import torchvision
 import pandas as pd
 import numpy as np
+import pickle
 
 from ultralytics import YOLO
 from skimage.metrics import structural_similarity as ssim
-from sklearn.model_selection import train_test_split  # type: ignore
+from sklearn.model_selection import RandomizedSearchCV, train_test_split  # type: ignore
 from sklearn.ensemble import RandomForestClassifier  # type: ignore
-from sklearn.metrics import accuracy_score # type: ignore
+from sklearn.metrics import accuracy_score, roc_auc_score  # type: ignore
 
-from utils import create_race_dataset, plot_rider_tracks, save_to_csv # type: ignore
+from utils import create_race_dataset, plot_rider_tracks, save_to_csv  # type: ignore
 from post_operations import clean_track_history, fill_centroid_lists
 from video_utils import prepare_dict_trimmed_videos
 from winner import add_direction_to_track_history, determine_winner
@@ -119,6 +121,7 @@ def track_riders(herd, people, current_track):
 
 
 def plot_frame(frame, boxes):
+    '''This function plots the bounding boxes for the giving bounding boxes'''
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         # confidence = box.conf.item()  # Confidence score
@@ -187,8 +190,7 @@ def get_track_history(model, file_name, test=False):
 
     # Determine Winner for all scenes
     add_direction_to_track_history(track_history, num_points=10)
-    if test is not False:
-        determine_winner(track_history, width, height)
+    determine_winner(track_history, width, height)
 
     # Post Operations
     final_list = clean_track_history(track_history)
@@ -197,10 +199,12 @@ def get_track_history(model, file_name, test=False):
 
     return final_list
 
+
 def convert_to_numeric_list(y_values):
     if isinstance(y_values, str):
         y_values = ast.literal_eval(y_values)
     return [float(value) for value in y_values]
+
 
 def extract_features_from_sequences(df):
     df['y_values'] = df['y_values'].apply(convert_to_numeric_list)
@@ -210,29 +214,74 @@ def extract_features_from_sequences(df):
     df['y_max'] = df['y_values'].apply(np.max)
     return df[['y_mean', 'y_std', 'y_min', 'y_max']], df['winner']
 
+
 def train_and_test(train_file_name, test_file_name) -> None:
     df = pd.read_csv(train_file_name)
     new_video_df = pd.read_csv(test_file_name)
 
     X, y = extract_features_from_sequences(df)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42)
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    # Train the model
-    model = RandomForestClassifier()
-    model.fit(X_train, y_train)
+    model = None
+    filename = "model.pkl"
+    if os.path.isfile(filename):
+        with open(filename, 'rb') as f:
+            model = pickle.load(f)
+    else:
+        model = RandomForestClassifier()
+        model.fit(X_train, y_train)
+        with open(filename, 'wb') as f:
+            pickle.dump(model, f)
 
     # Evaluate the model
     y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+
     accuracy = accuracy_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_pred_proba)
     print(f"Training accuracy: {accuracy:.2f}")
+    print(f"AUC: {auc:.2f}")
+
+    rs_model = None
+    filename = "model_rfc.pkl"
+    if os.path.isfile(filename):
+        with open(filename, 'rb') as f:
+            rs_model = pickle.load(f)
+    else:
+        # Hyperparameter Tuning with Random Search
+        rfc_search_space = {
+            'n_estimators': range(10, 101),
+            'criterion': ['gini', 'entropy'],
+            'max_depth': range(2, 51),
+            'min_samples_split': range(2, 11),
+            'min_samples_leaf': range(1, 11),
+            'max_features': ['sqrt', 'log2', None]
+        }
+
+        rfc = RandomForestClassifier()
+        rs_model = RandomizedSearchCV(
+            estimator=rfc, param_distributions=rfc_search_space, n_iter=100, cv=5)
+        rs_model.fit(X_train, y_train)
+        with open(filename, 'wb') as f:
+            pickle.dump(rs_model, f)
+
+    best_params = rs_model.best_params_
+    rfc = RandomForestClassifier(**best_params)
+    rfc.fit(X_train, y_train)
+
+    y_pred = rfc.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print("Accuracy HTRS:", accuracy)
 
     X_new, _ = extract_features_from_sequences(new_video_df)
 
-    new_predictions = model.predict(X_new)
+    # new_predictions = model.predict(X_new)
+    new_predictions = rfc.predict(X_new)
 
     new_video_df['predicted_winner'] = new_predictions
     new_video_df.to_csv('new_video_predictions.csv', index=False)
+
 
 def main() -> None:
 
