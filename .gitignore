@@ -5,7 +5,8 @@
 *.zip
 *.rar
 
-/__pycache__/*
+**/__pycache__/
 /downloaded_videos/*
 /trimmed_videos/*
 /graphs/*
+/src/__pycache__/*

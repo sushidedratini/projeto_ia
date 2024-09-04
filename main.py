@@ -1,24 +1,20 @@
-import ast
-import os
-import sys
 from typing import List, Dict
+
+import numpy as np
 import cv2
 import torch
 import torchvision
-import pandas as pd
-import numpy as np
-import pickle
+import sys
 
 from ultralytics import YOLO
 from skimage.metrics import structural_similarity as ssim
-from sklearn.model_selection import RandomizedSearchCV, train_test_split  # type: ignore
-from sklearn.ensemble import RandomForestClassifier  # type: ignore
-from sklearn.metrics import accuracy_score, roc_auc_score  # type: ignore
 
-from utils import create_race_dataset, plot_rider_tracks, save_to_csv  # type: ignore
-from post_operations import clean_track_history, fill_centroid_lists
-from video_utils import prepare_dict_trimmed_videos
-from winner import add_direction_to_track_history, determine_winner
+from src.camera_operations import calculate_background_motion, calculate_optical_flow, save_optical_flow_image
+from src.post_operations import clean_track_history, fill_centroid_lists, fill_speed_lists
+from src.train_test import train_and_test
+from src.utils import create_race_dataset, plot_roc_curve_graph, save_to_csv
+from src.video_utils import generate_subclip, prepare_dict_trimmed_videos
+from src.winner import determine_winner_in_scene
 
 
 def detect_camera_change(frame1, frame2, threshold=0.5):
@@ -78,7 +74,7 @@ def best_iou_found(obj_bbox, iter_bboxes, threshold) -> bool:
     return False
 
 
-def track_riders(herd, people, current_track):
+def track_riders(herd: list, people: list, current_track: dict):
     for person in people:
 
         person_bbox_xyxy = person.xyxy.cpu()
@@ -143,6 +139,50 @@ def plot_frame(frame, boxes):
     return frame
 
 
+def calculate_competitor_speed(flow, competitor_coords, background_motion):
+    """
+    Calcula a velocidade dos competidores subtraindo o movimento do background.
+    """
+    speeds = []
+    for (x, y) in competitor_coords:
+        flow_at_competitor = flow[int(y), int(x)]
+        relative_motion = flow_at_competitor - background_motion
+        speed = np.linalg.norm(relative_motion)
+        speeds.append(speed)
+    return speeds
+
+
+def estimate_direction(flow, competitor_coords):
+    """
+    Estima a direção de movimento dos competidores com base no optical flow.
+    """
+    directions = []
+    for (x, y) in competitor_coords:
+        flow_at_competitor = flow[int(y), int(x)]
+        directions.append(flow_at_competitor)
+    return directions
+
+
+def filter_track_history_by_speed(track_history):
+    """
+    Remove entradas no track_history que não possuem a chave 'SPEED'.
+    """
+    filtered_track_history = []
+
+    for scene in track_history:
+        filtered_scene = {}
+        for rider_id, info in scene.items():
+            # Verifica se o item possui a chave 'SPEED'
+            if 'SPEEDS' in info:
+                filtered_scene[rider_id] = info
+
+        # Somente adiciona a cena se houver pelo menos um competidor com 'SPEED'
+        if filtered_scene:
+            filtered_track_history.append(filtered_scene)
+
+    return filtered_track_history
+
+
 def get_track_history(model, file_name, test=False):
     cap = cv2.VideoCapture(file_name)
     ret, prev_frame = cap.read()
@@ -158,6 +198,8 @@ def get_track_history(model, file_name, test=False):
         if not ret:
             break
 
+        # current_frame_number = cap.get(cv2.CAP_PROP_POS_FRAMES)
+
         results = model.track(frame, persist=True,
                               show_conf=True, classes=[0, 17], device='cuda')
 
@@ -167,6 +209,40 @@ def get_track_history(model, file_name, test=False):
 
         herd = [box for box in results[0].boxes if box.cls == 17]  # Horse
         people = [box for box in results[0].boxes if box.cls == 0]  # Person
+
+        # Calcular Optical Flow para o cálculo de velocidade e direção
+        if prev_frame is not None:
+            flow, _ = calculate_optical_flow(prev_frame, frame)
+            # new_img = f'data/flow/{index}_{current_frame_number}.png'
+            # save_optical_flow_image(flow_img, new_img)
+            competitor_coords = [info['CENTROIDS'][-1]
+                                 for info in current_track.values() if 'CENTROIDS' in info]
+
+            # Calcular o movimento do background
+            background_motion = calculate_background_motion(flow)
+
+            # Calcular a velocidade dos competidores
+            speeds = calculate_competitor_speed(
+                flow, competitor_coords, background_motion)
+
+            # Estimar a direção dos competidores
+            directions = estimate_direction(flow, competitor_coords)
+
+            # Atualizar as velocidades e direções no histórico de track
+            for idx, (_, info) in enumerate(current_track.items()):
+                if 'CENTROIDS' in info:
+                    # Se o campo de velocidade não existir, inicializar com [0]
+                    if 'SPEEDS' not in info:
+                        info['SPEEDS'] = [0]
+                    # Adicionar a nova velocidade ao array de velocidades
+                    info['SPEEDS'].append(speeds[idx])
+
+                    # Se o campo de direção não existir, inicializar com a primeira direção
+                    if 'DIRECTION_VECTOR' not in info:
+                        info['DIRECTION_VECTOR'] = []
+
+                    # Adicionar a nova direção ao array de direção
+                    info['DIRECTION_VECTOR'].append(directions[idx])
 
         current_track = track_riders(herd, people, current_track)
 
@@ -189,98 +265,18 @@ def get_track_history(model, file_name, test=False):
     cv2.destroyAllWindows()
 
     # Determine Winner for all scenes
-    add_direction_to_track_history(track_history, num_points=10)
-    determine_winner(track_history, width, height)
+    # add_direction_to_track_history(track_history, num_points=10)
 
     # Post Operations
     final_list = clean_track_history(track_history)
     final_list = fill_centroid_lists(final_list)
     final_list = normalize_centroids(final_list, width, height)
 
+    filtered_track_history = filter_track_history_by_speed(final_list)
+    final_list = fill_speed_lists(filtered_track_history)
+    determine_winner_in_scene(final_list)
+
     return final_list
-
-
-def convert_to_numeric_list(y_values):
-    if isinstance(y_values, str):
-        y_values = ast.literal_eval(y_values)
-    return [float(value) for value in y_values]
-
-
-def extract_features_from_sequences(df):
-    df['y_values'] = df['y_values'].apply(convert_to_numeric_list)
-    df['y_mean'] = df['y_values'].apply(np.mean)
-    df['y_std'] = df['y_values'].apply(np.std)
-    df['y_min'] = df['y_values'].apply(np.min)
-    df['y_max'] = df['y_values'].apply(np.max)
-    return df[['y_mean', 'y_std', 'y_min', 'y_max']], df['winner']
-
-
-def train_and_test(train_file_name, test_file_name) -> None:
-    df = pd.read_csv(train_file_name)
-    new_video_df = pd.read_csv(test_file_name)
-
-    X, y = extract_features_from_sequences(df)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42)
-
-    model = None
-    filename = "model.pkl"
-    if os.path.isfile(filename):
-        with open(filename, 'rb') as f:
-            model = pickle.load(f)
-    else:
-        model = RandomForestClassifier()
-        model.fit(X_train, y_train)
-        with open(filename, 'wb') as f:
-            pickle.dump(model, f)
-
-    # Evaluate the model
-    y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
-
-    accuracy = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_pred_proba)
-    print(f"Training accuracy: {accuracy:.2f}")
-    print(f"AUC: {auc:.2f}")
-
-    rs_model = None
-    filename = "model_rfc.pkl"
-    if os.path.isfile(filename):
-        with open(filename, 'rb') as f:
-            rs_model = pickle.load(f)
-    else:
-        # Hyperparameter Tuning with Random Search
-        rfc_search_space = {
-            'n_estimators': range(10, 101),
-            'criterion': ['gini', 'entropy'],
-            'max_depth': range(2, 51),
-            'min_samples_split': range(2, 11),
-            'min_samples_leaf': range(1, 11),
-            'max_features': ['sqrt', 'log2', None]
-        }
-
-        rfc = RandomForestClassifier()
-        rs_model = RandomizedSearchCV(
-            estimator=rfc, param_distributions=rfc_search_space, n_iter=100, cv=5)
-        rs_model.fit(X_train, y_train)
-        with open(filename, 'wb') as f:
-            pickle.dump(rs_model, f)
-
-    best_params = rs_model.best_params_
-    rfc = RandomForestClassifier(**best_params)
-    rfc.fit(X_train, y_train)
-
-    y_pred = rfc.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    print("Accuracy HTRS:", accuracy)
-
-    X_new, _ = extract_features_from_sequences(new_video_df)
-
-    # new_predictions = model.predict(X_new)
-    new_predictions = rfc.predict(X_new)
-
-    new_video_df['predicted_winner'] = new_predictions
-    new_video_df.to_csv('new_video_predictions.csv', index=False)
 
 
 def main() -> None:
@@ -297,6 +293,7 @@ def main() -> None:
 
     # Download and trim videos
     video_list: List[Dict] = prepare_dict_trimmed_videos()
+    print(video_list)
 
     all_track_histories = []
     for dict_video in video_list:
@@ -304,15 +301,15 @@ def main() -> None:
             track_history = get_track_history(model, video_path, True)
             all_track_histories.append(track_history)
 
-    csv_file_name = 'race_dataset_new.csv'
+    csv_file_name = 'data/train_dataset.csv'
     race_df = create_race_dataset(all_track_histories)
     # plot_rider_tracks(race_df)
     save_to_csv(race_df, csv_file_name)
 
     test_track_history = get_track_history(
-        model, r"D:\Workspace\IA\ProjetoFinal\test_video_trimmed.mp4")
+        model, r"D:\Workspace\IA\ProjetoFinal\data\test_video_2_trimmed.mp4", True)
     test_race_df = create_race_dataset([test_track_history])
-    csv_test_file_name = 'test_dataset.csv'
+    csv_test_file_name = 'data/test_dataset.csv'
     save_to_csv(test_race_df, csv_test_file_name)
 
     train_and_test(csv_file_name, csv_test_file_name)
